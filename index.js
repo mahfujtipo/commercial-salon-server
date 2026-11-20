@@ -67,6 +67,74 @@ app.get('/', (req, res) => {
 const router = express.Router();
 
 /* -------------------------------------------------------------------------- */
+/*                               Small helpers                                */
+/* -------------------------------------------------------------------------- */
+
+class ApiError extends Error {
+    constructor(status, message, errors = null) {
+        super(message);
+        this.status = status;
+        this.errors = errors;
+    }
+}
+
+const sendSuccess = (res, data = null, message = 'Success', status = 200, extra = {}) =>
+    res.status(status).json({ success: true, message, data, ...extra });
+
+const asString = (value) => (typeof value === 'string' ? value.trim() : '');
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const getPagination = (query, defaultLimit = 9, maxLimit = 50) => {
+    const page = Math.max(parseInt(query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(query.limit, 10) || defaultLimit, 1), maxLimit);
+    return { page, limit, skip: (page - 1) * limit };
+};
+
+const pageMeta = (total, page, limit) => ({
+    total,
+    page,
+    limit,
+    totalPages: Math.max(Math.ceil(total / limit), 1)
+});
+
+function isValidObjectId(id) {
+    return typeof id === 'string' && /^[a-fA-F0-9]{24}$/.test(id) && ObjectId.isValid(id);
+}
+
+const validateObjectId = (paramName = 'id') => (req, res, next) => {
+    if (!isValidObjectId(req.params[paramName])) {
+        return next(new ApiError(400, `Invalid ${paramName}`));
+    }
+    next();
+};
+
+/* ----------------------------- Date/time helpers --------------------------- */
+
+// Salon time zone: Bangladesh (UTC+6), same as your previous project
+function getBookingDateTime(date, time) {
+    return new Date(`${date}T${time}:00+06:00`);
+}
+
+function isValidBookingDate(date) {
+    if (typeof date !== 'string') return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+
+    const parsedDate = new Date(`${date}T00:00:00Z`);
+
+    return (
+        !isNaN(parsedDate.getTime()) &&
+        parsedDate.toISOString().slice(0, 10) === date
+    );
+}
+
+// Simple predefined list of salon time slots
+const TIME_SLOTS = [
+    '09:00', '10:00', '11:00', '12:00',
+    '14:00', '15:00', '16:00', '17:00'
+];
+
+/* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
 
