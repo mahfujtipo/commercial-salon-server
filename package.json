@@ -1,0 +1,31 @@
+{
+  "name": "salon-server",
+  "version": "1.0.0",
+  "description": "SalonBook - Salon Appointment Booking Platform (REST API)",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "make-admin": "node makeAdmin.js"
+  },
+  "keywords": ["salon", "booking", "express", "mongodb"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jose": "^6.2.15",
+    "mongodb": "^7.8.0",
+    "multer": "^2.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
