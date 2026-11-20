@@ -828,6 +828,67 @@ router.get('/appointments/:id', verifyToken, requireActiveUser, validateObjectId
     sendSuccess(res, appointment, 'Appointment fetched successfully');
 });
 
+// PATCH /appointments/:id/confirm (admin)
+router.patch('/appointments/:id/confirm', verifyToken, requireAdmin, validateObjectId('id'), async (req, res) => {
+    const id = new ObjectId(req.params.id);
+    const now = new Date();
+
+    const updated = await appointmentsCollection.findOneAndUpdate(
+        { _id: id, status: 'pending' },
+        { $set: { status: 'confirmed', confirmedAt: now, updatedAt: now } },
+        { returnDocument: 'after' }
+    );
+
+    if (!updated) {
+        const existing = await appointmentsCollection.findOne({ _id: id });
+        if (!existing) throw new ApiError(404, 'Appointment not found');
+        throw new ApiError(409, `Only pending appointments can be confirmed. This appointment is already ${existing.status}.`);
+    }
+
+    sendSuccess(res, updated, 'Appointment confirmed successfully');
+});
+
+// PATCH /appointments/:id/cancel (customer: own pending | admin: pending or confirmed)
+router.patch('/appointments/:id/cancel', verifyToken, requireActiveUser, validateObjectId('id'), async (req, res) => {
+    const id = new ObjectId(req.params.id);
+    const isAdmin = req.user.role === 'admin';
+    const now = new Date();
+
+    const filter = isAdmin
+        ? { _id: id, status: { $in: ['pending', 'confirmed'] } }
+        : { _id: id, customerId: req.user._id, status: 'pending' };
+
+    const updated = await appointmentsCollection.findOneAndUpdate(
+        filter,
+        {
+            $set: {
+                status: 'cancelled',
+                cancelledAt: now,
+                cancelledBy: isAdmin ? 'admin' : 'customer',
+                updatedAt: now
+            },
+            $unset: { slotKey: '' } // frees the time slot
+        },
+        { returnDocument: 'after' }
+    );
+
+    if (!updated) {
+        const ownershipFilter = isAdmin ? { _id: id } : { _id: id, customerId: req.user._id };
+        const existing = await appointmentsCollection.findOne(ownershipFilter);
+
+        if (!existing) throw new ApiError(404, 'Appointment not found');
+
+        throw new ApiError(
+            409,
+            isAdmin
+                ? 'This appointment is already cancelled.'
+                : `Only pending appointments can be cancelled. This appointment is already ${existing.status}.`
+        );
+    }
+
+    sendSuccess(res, updated, 'Appointment cancelled successfully');
+});
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
