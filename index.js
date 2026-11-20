@@ -293,6 +293,80 @@ const requireCustomer = (req, res, next) => {
     next();
 };
 
+/* ================================= USERS ================================== */
+
+const safeUser = (user) => ({
+    _id: user._id,
+    name: user.name,
+    email: user.email,
+    image: user.image || '',
+    phone: user.phone || '',
+    role: user.role === 'admin' ? 'admin' : 'customer',
+    isBlocked: user.isBlocked === true,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt
+});
+
+async function findUserById(id) {
+    // Better Auth's Mongo adapter stores _id as ObjectId; fall back to string `id` field just in case
+    return (
+        (await usersCollection.findOne({ _id: new ObjectId(id) })) ||
+        (await usersCollection.findOne({ id }))
+    );
+}
+
+// GET /users/me  (allowed even if blocked, so the frontend can show the blocked state)
+router.get('/users/me', verifyToken, async (req, res) => {
+    const user = await usersCollection.findOne({ _id: req.user._id });
+    sendSuccess(res, safeUser(user), 'Profile fetched successfully');
+});
+
+// PATCH /users/me  (only name, image, phone allowed -> no mass assignment)
+router.patch('/users/me', verifyToken, requireActiveUser, async (req, res) => {
+    const updates = {};
+    const errors = {};
+
+    if (req.body.name !== undefined) {
+        const name = asString(req.body.name);
+        if (name.length < 2 || name.length > 80) errors.name = 'Name must be 2-80 characters';
+        else updates.name = name;
+    }
+
+    if (req.body.image !== undefined) {
+        const image = asString(req.body.image);
+        if (image) {
+            try {
+                const u = new URL(image);
+                if (!['http:', 'https:'].includes(u.protocol)) throw new Error();
+            } catch {
+                errors.image = 'Image must be a valid http(s) URL';
+            }
+        }
+        if (!errors.image) updates.image = image;
+    }
+
+    if (req.body.phone !== undefined) {
+        const phone = asString(req.body.phone);
+        if (phone && !/^\+?[\d\s-]{6,20}$/.test(phone)) errors.phone = 'Invalid phone number';
+        else updates.phone = phone;
+    }
+
+    if (Object.keys(errors).length > 0) {
+        throw new ApiError(400, 'Validation failed', errors);
+    }
+
+    if (Object.keys(updates).length === 0) {
+        throw new ApiError(400, 'No valid fields provided for update');
+    }
+
+    updates.updatedAt = new Date();
+
+    await usersCollection.updateOne({ _id: req.user._id }, { $set: updates });
+
+    const updated = await usersCollection.findOne({ _id: req.user._id });
+    sendSuccess(res, safeUser(updated), 'Profile updated successfully');
+});
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
