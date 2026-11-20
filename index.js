@@ -889,6 +889,88 @@ router.patch('/appointments/:id/cancel', verifyToken, requireActiveUser, validat
     sendSuccess(res, updated, 'Appointment cancelled successfully');
 });
 
+/* ================================ DASHBOARD =============================== */
+
+async function appointmentStatusCounts(match = {}) {
+    const rows = await appointmentsCollection
+        .aggregate([{ $match: match }, { $group: { _id: '$status', count: { $sum: 1 } } }])
+        .toArray();
+
+    const result = { total: 0, pending: 0, confirmed: 0, cancelled: 0 };
+
+    for (const row of rows) {
+        if (row._id in result) result[row._id] = row.count;
+        result.total += row.count;
+    }
+
+    return result;
+}
+
+// GET /dashboard/customer-stats
+router.get('/dashboard/customer-stats', verifyToken, requireCustomer, async (req, res) => {
+    const counts = await appointmentStatusCounts({ customerId: req.user._id });
+
+    sendSuccess(
+        res,
+        {
+            totalAppointments: counts.total,
+            pendingAppointments: counts.pending,
+            confirmedAppointments: counts.confirmed,
+            cancelledAppointments: counts.cancelled
+        },
+        'Customer statistics fetched successfully'
+    );
+});
+
+// GET /dashboard/admin-stats
+router.get('/dashboard/admin-stats', verifyToken, requireAdmin, async (req, res) => {
+    const [counts, totalCustomers, totalServices, activeServices, successfulPayments] = await Promise.all([
+        appointmentStatusCounts(),
+        usersCollection.countDocuments({ role: { $ne: 'admin' } }),
+        servicesCollection.countDocuments(),
+        servicesCollection.countDocuments({ status: 'active' }),
+        appointmentsCollection.countDocuments({ paymentStatus: 'paid' }) // stays 0 until Stripe is added
+    ]);
+
+    sendSuccess(
+        res,
+        {
+            totalCustomers,
+            totalServices,
+            activeServices,
+            inactiveServices: totalServices - activeServices,
+            totalAppointments: counts.total,
+            pendingAppointments: counts.pending,
+            confirmedAppointments: counts.confirmed,
+            cancelledAppointments: counts.cancelled,
+            totalSuccessfulPayments: successfulPayments
+        },
+        'Admin statistics fetched successfully'
+    );
+});
+
+// GET /dashboard/recent-appointments
+router.get('/dashboard/recent-appointments', verifyToken, requireAdmin, async (req, res) => {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 5, 1), 20);
+
+    const appointments = await appointmentsCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .project({
+            customerName: 1,
+            'serviceSnapshot.serviceName': 1,
+            appointmentDate: 1,
+            timeSlot: 1,
+            status: 1,
+            paymentStatus: 1,
+            createdAt: 1
+        })
+        .toArray();
+
+    sendSuccess(res, appointments, 'Recent appointments fetched successfully');
+});
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
