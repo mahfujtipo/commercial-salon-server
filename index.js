@@ -586,6 +586,84 @@ router.get('/services/:id', validateObjectId('id'), async (req, res) => {
     sendSuccess(res, service, 'Service fetched successfully');
 });
 
+// POST /services (admin)
+router.post('/services', verifyToken, requireAdmin, async (req, res) => {
+    const { data, errors } = validateServiceInput(req.body);
+
+    if (Object.keys(errors).length > 0) {
+        throw new ApiError(400, 'Validation failed', errors);
+    }
+
+    const now = new Date();
+    const result = await servicesCollection.insertOne({ ...data, createdAt: now, updatedAt: now });
+
+    const created = await servicesCollection.findOne({ _id: result.insertedId });
+    sendSuccess(res, created, 'Service created successfully', 201);
+});
+
+// PATCH /services/:id/status (admin)  -- before PATCH /services/:id for clarity
+router.patch('/services/:id/status', verifyToken, requireAdmin, validateObjectId('id'), async (req, res) => {
+    if (!SERVICE_STATUSES.includes(req.body.status)) {
+        throw new ApiError(400, 'Status must be active or inactive');
+    }
+
+    const updated = await servicesCollection.findOneAndUpdate(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status: req.body.status, updatedAt: new Date() } },
+        { returnDocument: 'after' }
+    );
+
+    if (!updated) throw new ApiError(404, 'Service not found');
+
+    sendSuccess(res, updated, `Service ${req.body.status === 'active' ? 'activated' : 'deactivated'} successfully`);
+});
+
+// PATCH /services/:id (admin)
+router.patch('/services/:id', verifyToken, requireAdmin, validateObjectId('id'), async (req, res) => {
+    const { data, errors } = validateServiceInput(req.body, { partial: true });
+
+    if (Object.keys(errors).length > 0) {
+        throw new ApiError(400, 'Validation failed', errors);
+    }
+
+    if (Object.keys(data).length === 0) {
+        throw new ApiError(400, 'No valid fields provided for update');
+    }
+
+    const updated = await servicesCollection.findOneAndUpdate(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { ...data, updatedAt: new Date() } },
+        { returnDocument: 'after' }
+    );
+
+    if (!updated) throw new ApiError(404, 'Service not found');
+
+    sendSuccess(res, updated, 'Service updated successfully');
+});
+
+// DELETE /services/:id (admin)
+router.delete('/services/:id', verifyToken, requireAdmin, validateObjectId('id'), async (req, res) => {
+    const serviceId = new ObjectId(req.params.id);
+
+    const activeAppointment = await appointmentsCollection.findOne({
+        serviceId,
+        status: { $in: ['pending', 'confirmed'] }
+    });
+
+    if (activeAppointment) {
+        throw new ApiError(
+            409,
+            'This service has pending or confirmed appointments. Deactivate it instead of deleting.'
+        );
+    }
+
+    const result = await servicesCollection.deleteOne({ _id: serviceId });
+
+    if (result.deletedCount === 0) throw new ApiError(404, 'Service not found');
+
+    sendSuccess(res, null, 'Service deleted successfully');
+});
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
