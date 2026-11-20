@@ -664,6 +664,110 @@ router.delete('/services/:id', verifyToken, requireAdmin, validateObjectId('id')
     sendSuccess(res, null, 'Service deleted successfully');
 });
 
+/* ============================== APPOINTMENTS ============================== */
+
+// GET /appointments/time-slots (public) -> predefined slot list
+router.get('/appointments/time-slots', (req, res) => {
+    sendSuccess(res, TIME_SLOTS, 'Time slots fetched successfully');
+});
+
+// GET /appointments/availability?date=YYYY-MM-DD (authenticated) -> which slots are booked
+router.get('/appointments/availability', verifyToken, async (req, res) => {
+    const date = asString(req.query.date);
+
+    if (!isValidBookingDate(date)) throw new ApiError(400, 'Invalid date. Use YYYY-MM-DD');
+
+    const booked = await appointmentsCollection
+        .find({ appointmentDate: date, status: { $in: ['pending', 'confirmed'] } })
+        .project({ timeSlot: 1, _id: 0 })
+        .toArray();
+
+    const bookedSlots = booked.map((a) => a.timeSlot);
+
+    sendSuccess(
+        res,
+        {
+            date,
+            bookedSlots,
+            availableSlots: TIME_SLOTS.filter((slot) => !bookedSlots.includes(slot))
+        },
+        'Availability fetched successfully'
+    );
+});
+
+// POST /appointments (customer)
+router.post('/appointments', writeLimiter, verifyToken, requireCustomer, async (req, res) => {
+    const serviceId = asString(req.body.serviceId);
+    const appointmentDate = asString(req.body.appointmentDate);
+    const timeSlot = asString(req.body.timeSlot);
+    const message = asString(req.body.message);
+
+    const errors = {};
+    if (!isValidObjectId(serviceId)) errors.serviceId = 'Invalid service ID';
+    if (!isValidBookingDate(appointmentDate)) errors.appointmentDate = 'Invalid date. Use YYYY-MM-DD';
+    if (!TIME_SLOTS.includes(timeSlot)) errors.timeSlot = 'Invalid time slot';
+    if (message.length > 500) errors.message = 'Message must be 500 characters or less';
+
+    if (Object.keys(errors).length > 0) {
+        throw new ApiError(400, 'Validation failed', errors);
+    }
+
+    // No appointments in the past
+    if (getBookingDateTime(appointmentDate, timeSlot) <= new Date()) {
+        throw new ApiError(400, 'You cannot book an appointment in the past');
+    }
+
+    // Price / name / duration ALWAYS come from the database, never from the frontend
+    const service = await servicesCollection.findOne({ _id: new ObjectId(serviceId) });
+
+    if (!service) throw new ApiError(404, 'Service not found');
+    if (service.status !== 'active') throw new ApiError(400, 'This service is currently not available for booking');
+
+    const slotKey = `${appointmentDate}_${timeSlot}`;
+
+    // Friendly pre-check (the unique index below is the real protection)
+    const existing = await appointmentsCollection.findOne({ slotKey });
+    if (existing) throw new ApiError(409, 'This time slot is already booked. Please choose another one.');
+
+    const now = new Date();
+
+    const appointment = {
+        serviceId: service._id,
+        customerId: req.user._id,
+        customerName: req.user.name,
+        customerEmail: req.user.email,
+        customerPhone: req.user.phone || '',
+        serviceSnapshot: {
+            serviceName: service.serviceName,
+            category: service.category,
+            image: service.image,
+            price: service.price,
+            duration: service.duration
+        },
+        servicePrice: service.price,
+        appointmentDate,
+        timeSlot,
+        message,
+        status: 'pending',
+        paymentStatus: 'unpaid',
+        slotKey,
+        createdAt: now,
+        updatedAt: now
+    };
+
+    try {
+        const result = await appointmentsCollection.insertOne(appointment);
+        const created = await appointmentsCollection.findOne({ _id: result.insertedId });
+        sendSuccess(res, created, 'Appointment request submitted successfully', 201);
+    } catch (err) {
+        // Two people booked the same slot at the same moment -> unique index rejects the second one
+        if (err.code === 11000) {
+            throw new ApiError(409, 'This time slot was just booked by someone else. Please choose another one.');
+        }
+        throw err;
+    }
+});
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
