@@ -768,6 +768,66 @@ router.post('/appointments', writeLimiter, verifyToken, requireCustomer, async (
     }
 });
 
+// GET /appointments/my-appointments (customer)
+router.get('/appointments/my-appointments', verifyToken, requireCustomer, async (req, res) => {
+    const { page, limit, skip } = getPagination(req.query, 10, 100);
+    const filter = { customerId: req.user._id };
+
+    if (['pending', 'confirmed', 'cancelled'].includes(req.query.status)) filter.status = req.query.status;
+
+    const [appointments, total] = await Promise.all([
+        appointmentsCollection.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+        appointmentsCollection.countDocuments(filter)
+    ]);
+
+    sendSuccess(res, appointments, 'Appointments fetched successfully', 200, {
+        pagination: pageMeta(total, page, limit)
+    });
+});
+
+// GET /appointments (admin)
+router.get('/appointments', verifyToken, requireAdmin, async (req, res) => {
+    const { page, limit, skip } = getPagination(req.query, 10, 100);
+    const filter = {};
+
+    if (['pending', 'confirmed', 'cancelled'].includes(req.query.status)) filter.status = req.query.status;
+    if (['unpaid', 'paid'].includes(req.query.paymentStatus)) filter.paymentStatus = req.query.paymentStatus;
+    if (isValidBookingDate(asString(req.query.date))) filter.appointmentDate = asString(req.query.date);
+
+    const search = asString(req.query.search);
+    if (search) {
+        const regex = new RegExp(escapeRegex(search), 'i');
+        filter.$or = [
+            { customerName: regex },
+            { customerEmail: regex },
+            { 'serviceSnapshot.serviceName': regex }
+        ];
+    }
+
+    const [appointments, total] = await Promise.all([
+        appointmentsCollection.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+        appointmentsCollection.countDocuments(filter)
+    ]);
+
+    sendSuccess(res, appointments, 'Appointments fetched successfully', 200, {
+        pagination: pageMeta(total, page, limit)
+    });
+});
+
+// GET /appointments/:id (customer own / admin any)
+router.get('/appointments/:id', verifyToken, requireActiveUser, validateObjectId('id'), async (req, res) => {
+    const filter = { _id: new ObjectId(req.params.id) };
+
+    // Customers can only see their own appointments
+    if (req.user.role !== 'admin') filter.customerId = req.user._id;
+
+    const appointment = await appointmentsCollection.findOne(filter);
+
+    if (!appointment) throw new ApiError(404, 'Appointment not found');
+
+    sendSuccess(res, appointment, 'Appointment fetched successfully');
+});
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
