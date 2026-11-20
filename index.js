@@ -537,6 +537,55 @@ async function listServices(req, res, adminView) {
 // GET /services  (public, active only)
 router.get('/services', (req, res) => listServices(req, res, false));
 
+// GET /services/featured (public) -> latest active services
+router.get('/services/featured', async (req, res) => {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 20);
+
+    const services = await servicesCollection
+        .find({ status: 'active' })
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .toArray();
+
+    sendSuccess(res, services, 'Featured services fetched successfully');
+});
+
+// GET /services/categories (public)
+router.get('/services/categories', async (req, res) => {
+    const categories = await servicesCollection
+        .aggregate([
+            { $match: { status: 'active' } },
+            { $group: { _id: '$category', count: { $sum: 1 } } },
+            { $sort: { _id: 1 } },
+            { $project: { _id: 0, category: '$_id', count: 1 } }
+        ])
+        .toArray();
+
+    sendSuccess(res, categories, 'Categories fetched successfully');
+});
+
+// GET /services/admin/all (admin: active + inactive)
+router.get('/services/admin/all', verifyToken, requireAdmin, (req, res) => listServices(req, res, true));
+
+// GET /services/admin/:id (admin: active or inactive, for edit page)
+router.get('/services/admin/:id', verifyToken, requireAdmin, validateObjectId('id'), async (req, res) => {
+    const service = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!service) throw new ApiError(404, 'Service not found');
+    sendSuccess(res, service, 'Service fetched successfully');
+});
+
+// GET /services/:id (public)
+router.get('/services/:id', validateObjectId('id'), async (req, res) => {
+    const service = await servicesCollection.findOne({
+        _id: new ObjectId(req.params.id),
+        status: 'active'
+    });
+
+    if (!service) throw new ApiError(404, 'Service not found or no longer available');
+
+    sendSuccess(res, service, 'Service fetched successfully');
+});
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
