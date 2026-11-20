@@ -135,6 +135,55 @@ const TIME_SLOTS = [
 ];
 
 /* -------------------------------------------------------------------------- */
+/*                               MongoDB setup                                */
+/* -------------------------------------------------------------------------- */
+
+const client = new MongoClient(process.env.MONGODB_URI);
+
+let connectionPromise;
+
+export async function connectToMongoDB() {
+    if (!connectionPromise) {
+        connectionPromise = client.connect().catch((err) => {
+            connectionPromise = null;
+            throw err;
+        });
+    }
+
+    try {
+        await connectionPromise;
+        console.log('You successfully connected to MongoDB!');
+        return client;
+    } catch (err) {
+        console.error('MongoDB connection failed:', err);
+        throw err;
+    }
+}
+
+const mongoClient = await connectToMongoDB();
+
+const db = mongoClient.db('salon-database');
+
+// Better Auth's own user collection (it manages auth data; we extend it with role/isBlocked/phone)
+const usersCollection = db.collection(process.env.USER_COLLECTION || 'user');
+const servicesCollection = db.collection('services');
+const appointmentsCollection = db.collection('appointments');
+
+// Indexes (safe to run on every start)
+try {
+    // Database-level double-booking protection:
+    // slotKey exists ONLY on pending/confirmed appointments (removed on cancel),
+    // and a sparse unique index means two active appointments can never share a slot.
+    await appointmentsCollection.createIndex({ slotKey: 1 }, { unique: true, sparse: true });
+    await appointmentsCollection.createIndex({ customerId: 1, createdAt: -1 });
+    await appointmentsCollection.createIndex({ status: 1, createdAt: -1 });
+    await servicesCollection.createIndex({ status: 1, category: 1 });
+    await servicesCollection.createIndex({ price: 1 });
+} catch (err) {
+    console.error('Index creation failed:', err);
+}
+
+/* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
 
