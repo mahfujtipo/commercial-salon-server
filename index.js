@@ -428,6 +428,115 @@ router.patch('/users/:id/unblock', verifyToken, requireAdmin, validateObjectId('
     setBlockedStatus(req, res, false)
 );
 
+/* ================================ SERVICES ================================ */
+
+const SERVICE_STATUSES = ['active', 'inactive'];
+
+function validateServiceInput(body, { partial = false } = {}) {
+    const data = {};
+    const errors = {};
+    const has = (key) => body[key] !== undefined;
+
+    if (!partial || has('serviceName')) {
+        const v = asString(body.serviceName);
+        if (v.length < 2 || v.length > 100) errors.serviceName = 'Service name must be 2-100 characters';
+        else data.serviceName = v;
+    }
+
+    if (!partial || has('category')) {
+        const v = asString(body.category);
+        if (v.length < 2 || v.length > 50) errors.category = 'Category must be 2-50 characters';
+        else data.category = v;
+    }
+
+    if (!partial || has('description')) {
+        const v = asString(body.description);
+        if (v.length < 10 || v.length > 2000) errors.description = 'Description must be 10-2000 characters';
+        else data.description = v;
+    }
+
+    if (!partial || has('price')) {
+        const v = Number(body.price);
+        if (!Number.isFinite(v) || v <= 0) errors.price = 'Price must be a positive number';
+        else data.price = v;
+    }
+
+    if (!partial || has('duration')) {
+        const v = Number(body.duration);
+        if (!Number.isInteger(v) || v <= 0) errors.duration = 'Duration must be a positive whole number (minutes)';
+        else data.duration = v;
+    }
+
+    if (!partial || has('image')) {
+        const v = asString(body.image);
+        try {
+            const u = new URL(v);
+            if (!['http:', 'https:'].includes(u.protocol)) throw new Error();
+            data.image = v;
+        } catch {
+            errors.image = 'A valid image URL is required (upload the image first)';
+        }
+    }
+
+    if (has('status')) {
+        if (!SERVICE_STATUSES.includes(body.status)) errors.status = 'Status must be active or inactive';
+        else data.status = body.status;
+    } else if (!partial) {
+        data.status = 'active';
+    }
+
+    return { data, errors };
+}
+
+function buildServiceFilter(query, { adminView = false } = {}) {
+    const filter = {};
+
+    if (adminView) {
+        if (SERVICE_STATUSES.includes(query.status)) filter.status = query.status;
+    } else {
+        filter.status = 'active';
+    }
+
+    const search = asString(query.search);
+    if (search) filter.serviceName = { $regex: escapeRegex(search), $options: 'i' };
+
+    const category = asString(query.category);
+    if (category) filter.category = category;
+
+    const minPrice = Number(query.minPrice);
+    const maxPrice = Number(query.maxPrice);
+    const priceFilter = {};
+    if (query.minPrice !== undefined && query.minPrice !== '' && Number.isFinite(minPrice)) priceFilter.$gte = minPrice;
+    if (query.maxPrice !== undefined && query.maxPrice !== '' && Number.isFinite(maxPrice)) priceFilter.$lte = maxPrice;
+    if (Object.keys(priceFilter).length) filter.price = priceFilter;
+
+    return filter;
+}
+
+function buildServiceSort(sort) {
+    if (sort === 'price_asc') return { price: 1, _id: 1 };
+    if (sort === 'price_desc') return { price: -1, _id: 1 };
+    return { createdAt: -1, _id: 1 };
+}
+
+async function listServices(req, res, adminView) {
+    const { page, limit, skip } = getPagination(req.query, 9, 50);
+    const filter = buildServiceFilter(req.query, { adminView });
+    const sort = buildServiceSort(req.query.sort);
+
+    const [services, total] = await Promise.all([
+        servicesCollection.find(filter).sort(sort).skip(skip).limit(limit).toArray(),
+        servicesCollection.countDocuments(filter)
+    ]);
+
+    sendSuccess(res, services, 'Services fetched successfully', 200, {
+        pagination: pageMeta(total, page, limit)
+    });
+}
+
+// GET /services  (public, active only)
+router.get('/services', (req, res) => listServices(req, res, false));
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
