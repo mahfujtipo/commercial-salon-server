@@ -184,6 +184,116 @@ try {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                           JWT / Auth middlewares                           */
+/* -------------------------------------------------------------------------- */
+
+const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
+
+const jwtOptions = {};
+if (process.env.JWT_ISSUER) jwtOptions.issuer = process.env.JWT_ISSUER;
+if (process.env.JWT_AUDIENCE) jwtOptions.audience = process.env.JWT_AUDIENCE;
+
+// JWT Verification Middleware (same logic as your index.js)
+// + loads the CURRENT role / blocked status from MongoDB (never trusts the token for role)
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+            success: false,
+            message: 'Unauthorized',
+            errors: null
+        });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({
+            success: false,
+            message: 'Unauthorized',
+            errors: null
+        });
+    }
+
+    let payload;
+
+    try {
+        const result = await jwtVerify(token, JWKS, jwtOptions);
+        payload = result.payload;
+    } catch (error) {
+        console.error('JWT verification error:', error.code || error.message);
+
+        return res.status(401).json({
+            success: false,
+            message: 'Invalid or expired token',
+            errors: null
+        });
+    }
+
+    if (!payload.email || typeof payload.email !== 'string') {
+        return res.status(401).json({
+            success: false,
+            message: 'Invalid user token',
+            errors: null
+        });
+    }
+
+    try {
+        const dbUser = await usersCollection.findOne({
+            email: payload.email.toLowerCase()
+        });
+
+        if (!dbUser) {
+            return res.status(401).json({
+                success: false,
+                message: 'User account not found',
+                errors: null
+            });
+        }
+
+        req.tokenPayload = payload;
+        req.user = {
+            _id: dbUser._id,
+            name: dbUser.name,
+            email: dbUser.email,
+            image: dbUser.image || '',
+            phone: dbUser.phone || '',
+            role: dbUser.role === 'admin' ? 'admin' : 'customer',
+            isBlocked: dbUser.isBlocked === true
+        };
+
+        next();
+    } catch (err) {
+        next(err);
+    }
+};
+
+const requireAdmin = (req, res, next) => {
+    if (req.user?.role !== 'admin') {
+        return next(new ApiError(403, 'Forbidden: admin access only'));
+    }
+    next();
+};
+
+const requireActiveUser = (req, res, next) => {
+    if (req.user?.isBlocked) {
+        return next(new ApiError(403, 'Your account has been blocked. Please contact the salon.'));
+    }
+    next();
+};
+
+const requireCustomer = (req, res, next) => {
+    if (req.user?.role !== 'customer') {
+        return next(new ApiError(403, 'Forbidden: customer access only'));
+    }
+    if (req.user.isBlocked) {
+        return next(new ApiError(403, 'Your account has been blocked. Please contact the salon.'));
+    }
+    next();
+};
+
+/* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
 
