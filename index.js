@@ -367,6 +367,67 @@ router.patch('/users/me', verifyToken, requireActiveUser, async (req, res) => {
     sendSuccess(res, safeUser(updated), 'Profile updated successfully');
 });
 
+// GET /users  (admin) -> all customers
+router.get('/users', verifyToken, requireAdmin, async (req, res) => {
+    const { page, limit, skip } = getPagination(req.query, 10, 100);
+    const filter = { role: { $ne: 'admin' } };
+
+    const search = asString(req.query.search);
+    if (search) {
+        const regex = new RegExp(escapeRegex(search), 'i');
+        filter.$or = [{ name: regex }, { email: regex }];
+    }
+
+    if (req.query.isBlocked === 'true') filter.isBlocked = true;
+    if (req.query.isBlocked === 'false') filter.isBlocked = { $ne: true };
+
+    const [users, total] = await Promise.all([
+        usersCollection.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+        usersCollection.countDocuments(filter)
+    ]);
+
+    sendSuccess(res, users.map(safeUser), 'Customers fetched successfully', 200, {
+        pagination: pageMeta(total, page, limit)
+    });
+});
+
+// GET /users/:id (admin)
+router.get('/users/:id', verifyToken, requireAdmin, validateObjectId('id'), async (req, res) => {
+    const user = await findUserById(req.params.id);
+    if (!user) throw new ApiError(404, 'User not found');
+    sendSuccess(res, safeUser(user), 'User fetched successfully');
+});
+
+async function setBlockedStatus(req, res, blocked) {
+    const target = await findUserById(req.params.id);
+
+    if (!target) throw new ApiError(404, 'User not found');
+
+    if (target.role === 'admin') {
+        throw new ApiError(403, 'Admin accounts cannot be blocked or unblocked');
+    }
+
+    if (String(target._id) === String(req.user._id)) {
+        throw new ApiError(400, 'You cannot block yourself');
+    }
+
+    await usersCollection.updateOne(
+        { _id: target._id },
+        { $set: { isBlocked: blocked, updatedAt: new Date() } }
+    );
+
+    const updated = await usersCollection.findOne({ _id: target._id });
+    sendSuccess(res, safeUser(updated), blocked ? 'User blocked successfully' : 'User unblocked successfully');
+}
+
+router.patch('/users/:id/block', verifyToken, requireAdmin, validateObjectId('id'), (req, res) =>
+    setBlockedStatus(req, res, true)
+);
+
+router.patch('/users/:id/unblock', verifyToken, requireAdmin, validateObjectId('id'), (req, res) =>
+    setBlockedStatus(req, res, false)
+);
+
 /* -------------------------------------------------------------------------- */
 /*                         Mount router & error handling                      */
 /* -------------------------------------------------------------------------- */
