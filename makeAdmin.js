@@ -19,7 +19,7 @@ try {
     await client.connect();
 
     const result = await client
-        .db(process.env.DB_NAME || 'salon-database')
+        .db(process.env.DB_NAME || 'SalonBook')
         .collection(process.env.USER_COLLECTION || 'user')
         .updateOne({ email }, { $set: { role: 'admin', isBlocked: false, updatedAt: new Date() } });
 

@@ -12,7 +12,12 @@
     "dev": "nodemon index.js",
     "make-admin": "node makeAdmin.js"
   },
-  "keywords": ["salon", "booking", "express", "mongodb"],
+  "keywords": [
+    "salon",
+    "booking",
+    "express",
+    "mongodb"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
@@ -23,7 +28,8 @@
     "helmet": "^8.0.0",
     "jose": "^6.2.15",
     "mongodb": "^7.8.0",
-    "multer": "^2.0.0"
+    "multer": "^2.0.0",
+    "stripe": "^18.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

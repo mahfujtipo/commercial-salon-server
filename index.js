@@ -1,9 +1,11 @@
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
+import Stripe from 'stripe';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import 'dotenv/config';
 
@@ -21,6 +23,10 @@ if (!process.env.MONGODB_URI) {
 
 const AUTH_URL = (process.env.BETTER_AUTH_URL || process.env.CLIENT_URI).replace(/\/$/, '');
 
+// Stripe is optional at startup so the rest of the API still works without keys.
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const PAYMENT_CURRENCY = (process.env.PAYMENT_CURRENCY || 'usd').toLowerCase();
+
 app.set('trust proxy', 1);
 
 app.use(helmet());
@@ -29,6 +35,7 @@ app.use(cors({
     origin: process.env.CLIENT_URI,
     credentials: true
 }));
+app.use('/api/v1/webhooks/stripe', express.raw({ type: 'application/json' }));
 
 app.use(express.json({ limit: '1mb' }));
 
@@ -47,7 +54,6 @@ const writeLimiter = rateLimit({
     legacyHeaders: false,
     message: { success: false, message: 'Too many requests, please slow down', errors: null }
 });
-
 app.get('/', (req, res) => {
     res.send('SalonBook Backend is running successfully!');
 });
@@ -91,10 +97,6 @@ const validateObjectId = (paramName = 'id') => (req, res, next) => {
     }
     next();
 };
-
-/* ----------------------------- Date/time helpers --------------------------- */
-
-// Salon time zone: Bangladesh (UTC+6), same as your previous project
 function getBookingDateTime(date, time) {
     return new Date(`${date}T${time}:00+06:00`);
 }
@@ -116,8 +118,6 @@ const TIME_SLOTS = [
     '09:00', '10:00', '11:00', '12:00',
     '14:00', '15:00', '16:00', '17:00'
 ];
-
-
 const client = new MongoClient(process.env.MONGODB_URI);
 
 let connectionPromise;
@@ -142,18 +142,25 @@ export async function connectToMongoDB() {
 
 const mongoClient = await connectToMongoDB();
 
-const db = mongoClient.db(process.env.DB_NAME || 'salon-database');
+const db = mongoClient.db(process.env.DB_NAME || 'SalonBook');
 
 // Better Auth's own user collection (it manages auth data; we extend it with role/isBlocked/phone)
 const usersCollection = db.collection(process.env.USER_COLLECTION || 'user');
 const servicesCollection = db.collection('services');
 const appointmentsCollection = db.collection('appointments');
+const transactionsCollection = db.collection('transactions');
 
 // Indexes (safe to run on every start)
 try {
+    // Database-level double-booking protection:
+    // slotKey exists ONLY on pending/confirmed appointments (removed on cancel),
+    // and a sparse unique index means two active appointments can never share a slot.
     await appointmentsCollection.createIndex({ slotKey: 1 }, { unique: true, sparse: true });
     await appointmentsCollection.createIndex({ customerId: 1, createdAt: -1 });
     await appointmentsCollection.createIndex({ status: 1, createdAt: -1 });
+    // One transaction per Stripe Checkout session (also makes webhook retries idempotent)
+    await transactionsCollection.createIndex({ stripeSessionId: 1 }, { unique: true });
+    await transactionsCollection.createIndex({ customerId: 1, createdAt: -1 });
     await servicesCollection.createIndex({ status: 1, category: 1 });
     await servicesCollection.createIndex({ price: 1 });
 } catch (err) {
@@ -162,9 +169,11 @@ try {
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
 
 const jwtOptions = {};
-if (process.env.JWT_ISSUER) jwtOptions.issuer = process.env.JWT_ISSUER;
-if (process.env.JWT_AUDIENCE) jwtOptions.audience = process.env.JWT_AUDIENCE;
+if (process.env.BETTER_AUTH_ISSUER || process.env.JWT_ISSUER) jwtOptions.issuer = process.env.BETTER_AUTH_ISSUER || process.env.JWT_ISSUER;
+if (process.env.BETTER_AUTH_AUDIENCE || process.env.JWT_AUDIENCE) jwtOptions.audience = process.env.BETTER_AUTH_AUDIENCE || process.env.JWT_AUDIENCE;
 
+// JWT Verification Middleware (same logic as your index.js)
+// + loads the CURRENT role / blocked status from MongoDB (never trusts the token for role)
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers.authorization;
 
@@ -241,15 +250,12 @@ const verifyToken = async (req, res, next) => {
 
 const requireAdmin = (req, res, next) => {
     if (req.user?.isBlocked) {
-        return next(
-            new ApiError(403, 'Your account has been blocked. Please contact the salon.')
-        );
+        return next(new ApiError(403, 'Your account has been blocked. Please contact the salon.'));
     }
 
     if (req.user?.role !== 'admin') {
         return next(new ApiError(403, 'Forbidden: admin access only'));
     }
-
     next();
 };
 
@@ -269,6 +275,8 @@ const requireCustomer = (req, res, next) => {
     }
     next();
 };
+
+/* ================================= USERS ================================== */
 
 const safeUser = (user) => ({
     _id: user._id,
@@ -647,7 +655,7 @@ router.get('/appointments/time-slots', (req, res) => {
 });
 
 // GET /appointments/availability?date=YYYY-MM-DD (authenticated) -> which slots are booked
-router.get('/appointments/availability', verifyToken, async (req, res) => {
+router.get('/appointments/availability', verifyToken, requireActiveUser, async (req, res) => {
     const date = asString(req.query.date);
 
     if (!isValidBookingDate(date)) throw new ApiError(400, 'Invalid date. Use YYYY-MM-DD');
@@ -829,8 +837,26 @@ router.patch('/appointments/:id/cancel', verifyToken, requireActiveUser, validat
     const isAdmin = req.user.role === 'admin';
     const now = new Date();
 
+    if (isAdmin) {
+        const current = await appointmentsCollection.findOne({ _id: id });
+        if (!current) throw new ApiError(404, 'Appointment not found');
+        if (current.checkoutLockToken) {
+            throw new ApiError(409, 'Checkout is being prepared. Please try cancelling again shortly.');
+        }
+        if (current.status === 'confirmed' && current.checkoutSessionId) {
+            await expireCheckoutForCancellation(current);
+        }
+    }
+
+    // Paid appointments cannot be cancelled here: the money must be refunded in Stripe first.
+    // Exclude an appointment being checked out to avoid racing session creation.
     const filter = isAdmin
-        ? { _id: id, status: { $in: ['pending', 'confirmed'] } }
+        ? {
+            _id: id,
+            status: { $in: ['pending', 'confirmed'] },
+            paymentStatus: { $ne: 'paid' },
+            checkoutLockToken: { $exists: false }
+        }
         : { _id: id, customerId: req.user._id, status: 'pending' };
 
     const updated = await appointmentsCollection.findOneAndUpdate(
@@ -853,6 +879,13 @@ router.patch('/appointments/:id/cancel', verifyToken, requireActiveUser, validat
 
         if (!existing) throw new ApiError(404, 'Appointment not found');
 
+        if (existing.paymentStatus === 'paid') {
+            throw new ApiError(409, 'This appointment has already been paid. Refund the payment in Stripe before cancelling it.');
+        }
+        if (existing.checkoutLockToken) {
+            throw new ApiError(409, 'Checkout is being prepared. Please try cancelling again shortly.');
+        }
+
         throw new ApiError(
             409,
             isAdmin
@@ -863,6 +896,435 @@ router.patch('/appointments/:id/cancel', verifyToken, requireActiveUser, validat
 
     sendSuccess(res, updated, 'Appointment cancelled successfully');
 });
+
+/* ================================ PAYMENTS ================================ */
+
+function requireStripe() {
+    if (!stripe) throw new ApiError(500, 'Payments are not configured on the server');
+}
+
+function sessionMatchesAppointment(session, appointment, { checkAmount = false } = {}) {
+    const appointmentId = String(appointment._id);
+    const customerId = String(appointment.customerId);
+    if (
+        session.mode !== 'payment' ||
+        session.client_reference_id !== appointmentId ||
+        session.metadata?.appointmentId !== appointmentId ||
+        session.metadata?.customerId !== customerId
+    ) return false;
+    if (checkAmount && (!session.currency || session.currency.toLowerCase() !== PAYMENT_CURRENCY)) return false;
+    if (!checkAmount && session.currency && session.currency.toLowerCase() !== PAYMENT_CURRENCY) return false;
+    if (checkAmount && session.amount_total !== Math.round(Number(appointment.servicePrice) * 100)) return false;
+    return true;
+}
+
+async function releaseCheckoutSession(appointment, session, status) {
+    await transactionsCollection.updateOne(
+        { stripeSessionId: session.id, status: { $ne: 'paid' } },
+        {
+            $set: { status },
+            $setOnInsert: {
+                appointmentId: appointment._id,
+                customerId: appointment.customerId,
+                amount: (session.amount_total ?? 0) / 100,
+                currency: session.currency || PAYMENT_CURRENCY,
+                createdAt: new Date()
+            }
+        },
+        { upsert: true }
+    );
+    await appointmentsCollection.updateOne(
+        { _id: appointment._id, checkoutSessionId: session.id },
+        {
+            $unset: {
+                checkoutSessionId: '',
+                checkoutSessionExpiresAt: '',
+                checkoutAttemptId: '',
+                checkoutLockToken: '',
+                checkoutLockExpiresAt: ''
+            },
+            $set: { updatedAt: new Date() }
+        }
+    );
+}
+
+async function expireCheckoutForCancellation(appointment) {
+    if (!stripe) throw new ApiError(503, 'Cannot safely cancel while payment processing is unavailable');
+
+    let session;
+    try {
+        session = await stripe.checkout.sessions.retrieve(appointment.checkoutSessionId);
+    } catch (error) {
+        if (error.code !== 'resource_missing') throw error;
+    }
+
+    if (session && !sessionMatchesAppointment(session, appointment, { checkAmount: true })) {
+        throw new ApiError(409, 'Stored Checkout Session does not match this appointment.');
+    }
+    if (session?.status === 'open') {
+        session = await stripe.checkout.sessions.expire(session.id);
+    }
+    if (session?.status === 'complete') {
+        throw new ApiError(409, 'Payment is completing. Refresh the appointment before cancelling it.');
+    }
+    if (session?.status === 'expired') {
+        await releaseCheckoutSession(appointment, session, 'expired');
+    } else if (!session) {
+        await appointmentsCollection.updateOne(
+            { _id: appointment._id, checkoutSessionId: appointment.checkoutSessionId },
+            { $unset: { checkoutSessionId: '', checkoutSessionExpiresAt: '', checkoutAttemptId: '' } }
+        );
+    }
+}
+
+async function getReusableCheckout(appointment) {
+    if (!appointment.checkoutSessionId) return null;
+    let session;
+    try {
+        session = await stripe.checkout.sessions.retrieve(appointment.checkoutSessionId);
+    } catch (error) {
+        if (error.code !== 'resource_missing') throw error;
+    }
+    if (session && !sessionMatchesAppointment(session, appointment, { checkAmount: true })) {
+        throw new ApiError(409, 'Stored Checkout Session does not match this appointment.');
+    }
+    if (session?.status === 'open' && session.url) return session;
+    if (session?.status === 'expired') {
+        await releaseCheckoutSession(appointment, session, 'expired');
+        return null;
+    }
+    if (session?.status === 'complete') {
+        throw new ApiError(409, 'Payment is processing. Please refresh the appointment status.');
+    }
+    if (!session) {
+        await appointmentsCollection.updateOne(
+            { _id: appointment._id, checkoutSessionId: appointment.checkoutSessionId },
+            {
+                $unset: {
+                    checkoutSessionId: '',
+                    checkoutSessionExpiresAt: '',
+                    checkoutAttemptId: '',
+                    checkoutLockToken: '',
+                    checkoutLockExpiresAt: ''
+                }
+            }
+        );
+    }
+    return null;
+}
+
+// MongoDB lease plus Stripe idempotency prevents concurrent duplicate Checkout Sessions.
+router.post('/payments/checkout-session', writeLimiter, verifyToken, requireCustomer, async (req, res) => {
+    requireStripe();
+    const appointmentId = asString(req.body.appointmentId);
+    if (!isValidObjectId(appointmentId)) throw new ApiError(400, 'Invalid appointment ID');
+
+    let appointment = await appointmentsCollection.findOne({
+        _id: new ObjectId(appointmentId),
+        customerId: req.user._id
+    });
+    if (!appointment) throw new ApiError(404, 'Appointment not found');
+    if (appointment.status !== 'confirmed') throw new ApiError(409, 'Only confirmed appointments can be paid');
+    if (appointment.paymentStatus !== 'unpaid') throw new ApiError(409, 'This appointment is already paid');
+
+    const existingSession = await getReusableCheckout(appointment);
+    if (existingSession) return sendSuccess(res, { url: existingSession.url }, 'Checkout session reused');
+
+    const lockToken = randomUUID();
+    const now = new Date();
+    const claimed = await appointmentsCollection.findOneAndUpdate(
+        {
+            _id: appointment._id,
+            customerId: req.user._id,
+            status: 'confirmed',
+            paymentStatus: 'unpaid',
+            $or: [
+                { checkoutLockExpiresAt: { $exists: false } },
+                { checkoutLockExpiresAt: { $lte: now } }
+            ]
+        },
+        [{
+            $set: {
+                checkoutLockToken: lockToken,
+                checkoutLockExpiresAt: new Date(now.getTime() + 120000),
+                checkoutAttemptId: { $ifNull: ['$checkoutAttemptId', lockToken] }
+            }
+        }],
+        { returnDocument: 'after' }
+    );
+
+    if (!claimed) {
+        appointment = await appointmentsCollection.findOne({ _id: appointment._id });
+        const session = appointment ? await getReusableCheckout(appointment) : null;
+        if (session) return sendSuccess(res, { url: session.url }, 'Checkout session reused');
+        throw new ApiError(409, 'Checkout is already being prepared. Please try again shortly.');
+    }
+
+    let session;
+    try {
+        session = await stripe.checkout.sessions.create(
+            {
+                mode: 'payment',
+                customer_email: appointment.customerEmail,
+                client_reference_id: String(appointment._id),
+                line_items: [{
+                    quantity: 1,
+                    price_data: {
+                        currency: PAYMENT_CURRENCY,
+                        unit_amount: Math.round(Number(appointment.servicePrice) * 100),
+                        product_data: {
+                            name: appointment.serviceSnapshot.serviceName,
+                            description: 'Appointment on ' + appointment.appointmentDate + ' at ' + appointment.timeSlot
+                        }
+                    }
+                }],
+                metadata: {
+                    appointmentId: String(appointment._id),
+                    customerId: String(appointment.customerId)
+                },
+                success_url: process.env.CLIENT_URI + '/payment/success?session_id={CHECKOUT_SESSION_ID}',
+                cancel_url: process.env.CLIENT_URI + '/payment/cancel'
+            },
+            { idempotencyKey: 'salonbook-checkout-' + String(appointment._id) + '-' + claimed.checkoutAttemptId }
+        );
+        await appointmentsCollection.updateOne(
+            { _id: appointment._id, checkoutLockToken: lockToken },
+            {
+                $set: {
+                    checkoutSessionId: session.id,
+                    checkoutSessionExpiresAt: session.expires_at ? new Date(session.expires_at * 1000) : null,
+                    updatedAt: new Date()
+                },
+                $unset: { checkoutLockToken: '', checkoutLockExpiresAt: '' }
+            }
+        );
+    } catch (error) {
+        await appointmentsCollection.updateOne(
+            { _id: appointment._id, checkoutLockToken: lockToken },
+            { $unset: { checkoutLockToken: '', checkoutLockExpiresAt: '' } }
+        );
+        throw error;
+    }
+    sendSuccess(res, { url: session.url }, 'Checkout session created');
+});
+
+// Only verified webhooks update payment state; conditional writes make retries idempotent.
+async function recordPaidSession(session) {
+    const appointmentId = session.metadata?.appointmentId;
+    if (!isValidObjectId(appointmentId)) {
+        console.error('Stripe webhook: missing or invalid appointmentId metadata');
+        return;
+    }
+    const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
+    if (!appointment || !sessionMatchesAppointment(session, appointment, { checkAmount: true })) {
+        console.error('Stripe webhook: session does not match its appointment');
+        return;
+    }
+    if (session.payment_status !== 'paid') return;
+
+    if (appointment.paymentStatus === 'paid' && appointment.paymentSessionId === session.id) {
+        await transactionsCollection.updateOne(
+            { stripeSessionId: session.id },
+            {
+                $set: {
+                    status: 'paid',
+                    amount: session.amount_total / 100,
+                    currency: session.currency,
+                    updatedAt: new Date()
+                },
+                $setOnInsert: {
+                    appointmentId: appointment._id,
+                    customerId: appointment.customerId,
+                    createdAt: new Date()
+                }
+            },
+            { upsert: true }
+        );
+        return;
+    }
+    if (appointment.status !== 'confirmed' || appointment.paymentStatus !== 'unpaid') {
+        console.warn('Stripe webhook: appointment is no longer eligible for payment', appointmentId);
+        return;
+    }
+
+    const update = await appointmentsCollection.updateOne(
+        { _id: appointment._id, status: 'confirmed', paymentStatus: 'unpaid' },
+        {
+            $set: {
+                paymentStatus: 'paid',
+                paymentSessionId: session.id,
+                paidAt: new Date(),
+                updatedAt: new Date()
+            },
+            $unset: {
+                checkoutSessionId: '',
+                checkoutSessionExpiresAt: '',
+                checkoutAttemptId: '',
+                checkoutLockToken: '',
+                checkoutLockExpiresAt: ''
+            }
+        }
+    );
+    if (update.modifiedCount !== 1) return;
+
+    await transactionsCollection.updateOne(
+        { stripeSessionId: session.id },
+        {
+            $set: {
+                status: 'paid',
+                amount: session.amount_total / 100,
+                currency: session.currency,
+                updatedAt: new Date()
+            },
+            $setOnInsert: {
+                appointmentId: appointment._id,
+                customerId: appointment.customerId,
+                createdAt: new Date()
+            }
+        },
+        { upsert: true }
+    );
+}
+
+async function recordFailedSession(session, status = 'failed') {
+    const appointmentId = session.metadata?.appointmentId;
+    if (!isValidObjectId(appointmentId)) return;
+    const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
+    if (!appointment || !sessionMatchesAppointment(session, appointment)) return;
+
+    if (status === 'failed' && session.status === 'open') {
+        await transactionsCollection.updateOne(
+            { stripeSessionId: session.id, status: { $ne: 'paid' } },
+            {
+                $set: { status: 'failed', updatedAt: new Date() },
+                $setOnInsert: {
+                    appointmentId: appointment._id,
+                    customerId: appointment.customerId,
+                    amount: (session.amount_total ?? 0) / 100,
+                    currency: session.currency || PAYMENT_CURRENCY,
+                    createdAt: new Date()
+                }
+            },
+            { upsert: true }
+        );
+        return;
+    }
+
+    try {
+        await releaseCheckoutSession(appointment, session, status);
+    } catch (error) {
+        if (error.code !== 11000) throw error;
+    }
+}
+
+// Signature verification uses the raw body middleware registered before express.json().
+router.post('/webhooks/stripe', async (req, res) => {
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+        return res.status(500).json({ success: false, message: 'Stripe webhook is not configured', errors: null });
+    }
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(
+            req.body,
+            req.headers['stripe-signature'],
+            process.env.STRIPE_WEBHOOK_SECRET
+        );
+    } catch {
+        console.error('Stripe webhook signature verification failed');
+        return res.status(400).json({ success: false, message: 'Invalid webhook signature', errors: null });
+    }
+
+    switch (event.type) {
+        case 'checkout.session.completed':
+        case 'checkout.session.async_payment_succeeded': {
+            const session = event.data.object;
+            if (session.payment_status === 'paid') await recordPaidSession(session);
+            break;
+        }
+        case 'checkout.session.async_payment_failed':
+            await recordFailedSession(event.data.object, 'failed');
+            break;
+        case 'checkout.session.expired':
+            await recordFailedSession(event.data.object, 'expired');
+            break;
+        default:
+            break;
+    }
+    res.json({ received: true });
+});
+
+// GET /payments/status?session_id=cs_... (customer)
+// Used by the Payment Success page. It only reports what the webhook already stored.
+router.get('/payments/status', verifyToken, requireCustomer, async (req, res) => {
+    const sessionId = asString(req.query.session_id);
+
+    if (!/^cs_[A-Za-z0-9_]+$/.test(sessionId)) throw new ApiError(400, 'Invalid session ID');
+
+    const transaction = await transactionsCollection.findOne({
+        stripeSessionId: sessionId,
+        customerId: req.user._id
+    });
+
+    sendSuccess(
+        res,
+        transaction
+            ? { status: transaction.status, appointmentId: transaction.appointmentId }
+            : { status: 'processing' },
+        'Payment status fetched successfully'
+    );
+});
+
+// GET /transactions (admin, READ-ONLY). There is no endpoint to create or edit payments:
+// transactions are written only by the verified Stripe webhook.
+router.get('/transactions', verifyToken, requireAdmin, async (req, res) => {
+    const { page, limit, skip } = getPagination(req.query, 10, 100);
+    const match = {};
+
+    if (['paid', 'failed'].includes(req.query.status)) match.status = req.query.status;
+
+    const [items, total] = await Promise.all([
+        transactionsCollection
+            .aggregate([
+                { $match: match },
+                { $sort: { createdAt: -1 } },
+                { $skip: skip },
+                { $limit: limit },
+                {
+                    $lookup: {
+                        from: 'appointments',
+                        localField: 'appointmentId',
+                        foreignField: '_id',
+                        as: 'appointment'
+                    }
+                },
+                { $unwind: { path: '$appointment', preserveNullAndEmptyArrays: true } },
+                {
+                    $project: {
+                        appointmentId: 1,
+                        customerId: 1,
+                        amount: 1,
+                        currency: 1,
+                        stripeSessionId: 1,
+                        status: 1,
+                        createdAt: 1,
+                        customerName: '$appointment.customerName',
+                        customerEmail: '$appointment.customerEmail',
+                        serviceName: '$appointment.serviceSnapshot.serviceName',
+                        appointmentDate: '$appointment.appointmentDate',
+                        timeSlot: '$appointment.timeSlot'
+                    }
+                }
+            ])
+            .toArray(),
+        transactionsCollection.countDocuments(match)
+    ]);
+
+    sendSuccess(res, items, 'Transactions fetched successfully', 200, {
+        pagination: pageMeta(total, page, limit)
+    });
+});
+
+/* ================================ DASHBOARD =============================== */
 
 async function appointmentStatusCounts(match = {}) {
     const rows = await appointmentsCollection
@@ -902,7 +1364,7 @@ router.get('/dashboard/admin-stats', verifyToken, requireAdmin, async (req, res)
         usersCollection.countDocuments({ role: { $ne: 'admin' } }),
         servicesCollection.countDocuments(),
         servicesCollection.countDocuments({ status: 'active' }),
-        appointmentsCollection.countDocuments({ paymentStatus: 'paid' }) // stays 0 until Stripe is added
+        transactionsCollection.countDocuments({ status: 'paid' })
     ]);
 
     sendSuccess(
@@ -943,6 +1405,8 @@ router.get('/dashboard/recent-appointments', verifyToken, requireAdmin, async (r
 
     sendSuccess(res, appointments, 'Recent appointments fetched successfully');
 });
+
+/* ============================== IMAGE UPLOAD ============================== */
 
 const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 
@@ -1001,7 +1465,6 @@ router.post(
         );
     }
 );
-
 app.use('/api/v1', apiLimiter, router);
 
 // 404 for unknown routes
