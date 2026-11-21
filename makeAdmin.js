@@ -1,9 +1,6 @@
 import { MongoClient } from 'mongodb';
 import 'dotenv/config';
 
-// Usage: npm run make-admin -- admin@example.com
-// Register the account through the normal Sign Up page first, then run this once.
-
 const email = process.argv[2]?.toLowerCase();
 
 if (!email) {
@@ -22,7 +19,7 @@ try {
     await client.connect();
 
     const result = await client
-        .db('salon-database')
+        .db(process.env.DB_NAME || 'salon-database')
         .collection(process.env.USER_COLLECTION || 'user')
         .updateOne({ email }, { $set: { role: 'admin', isBlocked: false, updatedAt: new Date() } });
 

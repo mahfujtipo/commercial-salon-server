@@ -11,10 +11,6 @@ const app = express();
 const port = process.env.PORT || 8000;
 const isProduction = process.env.NODE_ENV === 'production';
 
-/* -------------------------------------------------------------------------- */
-/*                              Env validation                                */
-/* -------------------------------------------------------------------------- */
-
 if (!process.env.CLIENT_URI) {
     throw new Error('CLIENT_URI is missing from environment variables');
 }
@@ -24,10 +20,6 @@ if (!process.env.MONGODB_URI) {
 }
 
 const AUTH_URL = (process.env.BETTER_AUTH_URL || process.env.CLIENT_URI).replace(/\/$/, '');
-
-/* -------------------------------------------------------------------------- */
-/*                                Middlewares                                 */
-/* -------------------------------------------------------------------------- */
 
 app.set('trust proxy', 1);
 
@@ -56,20 +48,11 @@ const writeLimiter = rateLimit({
     message: { success: false, message: 'Too many requests, please slow down', errors: null }
 });
 
-/* -------------------------------------------------------------------------- */
-/*                                Base routes                                 */
-/* -------------------------------------------------------------------------- */
-
 app.get('/', (req, res) => {
     res.send('SalonBook Backend is running successfully!');
 });
 
 const router = express.Router();
-
-/* -------------------------------------------------------------------------- */
-/*                               Small helpers                                */
-/* -------------------------------------------------------------------------- */
-
 class ApiError extends Error {
     constructor(status, message, errors = null) {
         super(message);
@@ -134,9 +117,6 @@ const TIME_SLOTS = [
     '14:00', '15:00', '16:00', '17:00'
 ];
 
-/* -------------------------------------------------------------------------- */
-/*                               MongoDB setup                                */
-/* -------------------------------------------------------------------------- */
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
@@ -162,7 +142,7 @@ export async function connectToMongoDB() {
 
 const mongoClient = await connectToMongoDB();
 
-const db = mongoClient.db('salon-database');
+const db = mongoClient.db(process.env.DB_NAME || 'salon-database');
 
 // Better Auth's own user collection (it manages auth data; we extend it with role/isBlocked/phone)
 const usersCollection = db.collection(process.env.USER_COLLECTION || 'user');
@@ -171,9 +151,6 @@ const appointmentsCollection = db.collection('appointments');
 
 // Indexes (safe to run on every start)
 try {
-    // Database-level double-booking protection:
-    // slotKey exists ONLY on pending/confirmed appointments (removed on cancel),
-    // and a sparse unique index means two active appointments can never share a slot.
     await appointmentsCollection.createIndex({ slotKey: 1 }, { unique: true, sparse: true });
     await appointmentsCollection.createIndex({ customerId: 1, createdAt: -1 });
     await appointmentsCollection.createIndex({ status: 1, createdAt: -1 });
@@ -182,19 +159,12 @@ try {
 } catch (err) {
     console.error('Index creation failed:', err);
 }
-
-/* -------------------------------------------------------------------------- */
-/*                           JWT / Auth middlewares                           */
-/* -------------------------------------------------------------------------- */
-
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
 
 const jwtOptions = {};
 if (process.env.JWT_ISSUER) jwtOptions.issuer = process.env.JWT_ISSUER;
 if (process.env.JWT_AUDIENCE) jwtOptions.audience = process.env.JWT_AUDIENCE;
 
-// JWT Verification Middleware (same logic as your index.js)
-// + loads the CURRENT role / blocked status from MongoDB (never trusts the token for role)
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers.authorization;
 
@@ -270,9 +240,16 @@ const verifyToken = async (req, res, next) => {
 };
 
 const requireAdmin = (req, res, next) => {
+    if (req.user?.isBlocked) {
+        return next(
+            new ApiError(403, 'Your account has been blocked. Please contact the salon.')
+        );
+    }
+
     if (req.user?.role !== 'admin') {
         return next(new ApiError(403, 'Forbidden: admin access only'));
     }
+
     next();
 };
 
@@ -292,8 +269,6 @@ const requireCustomer = (req, res, next) => {
     }
     next();
 };
-
-/* ================================= USERS ================================== */
 
 const safeUser = (user) => ({
     _id: user._id,
@@ -889,8 +864,6 @@ router.patch('/appointments/:id/cancel', verifyToken, requireActiveUser, validat
     sendSuccess(res, updated, 'Appointment cancelled successfully');
 });
 
-/* ================================ DASHBOARD =============================== */
-
 async function appointmentStatusCounts(match = {}) {
     const rows = await appointmentsCollection
         .aggregate([{ $match: match }, { $group: { _id: '$status', count: { $sum: 1 } } }])
@@ -971,8 +944,6 @@ router.get('/dashboard/recent-appointments', verifyToken, requireAdmin, async (r
     sendSuccess(res, appointments, 'Recent appointments fetched successfully');
 });
 
-/* ============================== IMAGE UPLOAD ============================== */
-
 const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 
 const upload = multer({
@@ -1030,10 +1001,6 @@ router.post(
         );
     }
 );
-
-/* -------------------------------------------------------------------------- */
-/*                         Mount router & error handling                      */
-/* -------------------------------------------------------------------------- */
 
 app.use('/api/v1', apiLimiter, router);
 

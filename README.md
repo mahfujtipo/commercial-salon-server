@@ -47,7 +47,7 @@ The API runs on `http://localhost:8000` and all routes live under `/api/v1`.
 |---|---|
 | `PORT` | Server port |
 | `NODE_ENV` | `development` or `production` |
-| `MONGODB_URI` | MongoDB connection string (database: `salon-database`) |
+| `MONGODB_URI` | MongoDB connection string (database: `salonbook`) |
 | `CLIENT_URI` | Next.js client URL (CORS) |
 | `BETTER_AUTH_URL` | Better Auth base URL (JWKS discovery) |
 | `IMGBB_API_KEY` | ImgBB API key |
