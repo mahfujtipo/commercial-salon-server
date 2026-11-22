@@ -63,8 +63,8 @@ All REST endpoints use /api/v1. vercel.json configures the serverless entry poin
 
 ## Links
 
-- Live API: Not configured in this repository.
-- Client repository: Not available in the server Git configuration.
+- Live API: https://commercial-salon-server.vercel.app
+- Client repository: https://github.com/mahfujtipo/commercial-salon-clientside
 - Server repository: https://github.com/mahfujtipo/commercial-salon-server
 
 ## Core API routes
