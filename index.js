@@ -5,6 +5,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
+import sharp from 'sharp';
 import Stripe from 'stripe';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import 'dotenv/config';
@@ -1409,6 +1410,8 @@ router.get('/dashboard/recent-appointments', verifyToken, requireAdmin, async (r
 /* ============================== IMAGE UPLOAD ============================== */
 
 const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const MAX_IMAGE_PIXELS = 20_000_000;
+const MAX_IMAGE_PAGES = 100;
 
 function detectImageType(buffer) {
     if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
@@ -1416,6 +1419,50 @@ function detectImageType(buffer) {
     if (buffer.length >= 6 && ['GIF87a', 'GIF89a'].includes(buffer.toString('ascii', 0, 6))) return 'image/gif';
     if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
     return null;
+}
+
+async function isFullyDecodedImage(buffer, expectedType) {
+    const detectedType = detectImageType(buffer);
+    if (!detectedType || detectedType !== expectedType) return false;
+
+    const decoderOptions = {
+        animated: true,
+        failOn: 'warning',
+        limitInputPixels: MAX_IMAGE_PIXELS
+    };
+
+    try {
+        const metadata = await sharp(buffer, decoderOptions).metadata();
+        const formatTypes = {
+            jpeg: 'image/jpeg',
+            png: 'image/png',
+            gif: 'image/gif',
+            webp: 'image/webp'
+        };
+        const width = metadata.width || 0;
+        const frameHeight = metadata.pageHeight || metadata.height || 0;
+        const pages = metadata.pages || 1;
+
+        if (
+            formatTypes[metadata.format] !== detectedType ||
+            !Number.isSafeInteger(width) ||
+            !Number.isSafeInteger(frameHeight) ||
+            !Number.isSafeInteger(pages) ||
+            width <= 0 ||
+            frameHeight <= 0 ||
+            pages <= 0 ||
+            pages > MAX_IMAGE_PAGES ||
+            width * frameHeight * pages > MAX_IMAGE_PIXELS
+        ) {
+            return false;
+        }
+
+        // Decode every frame to raw pixels; metadata parsing alone does not validate the image data.
+        await sharp(buffer, decoderOptions).raw().toBuffer();
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 const upload = multer({
@@ -1439,9 +1486,11 @@ router.post(
     async (req, res) => {
         if (!req.file) throw new ApiError(400, 'Please attach an image file (field name: image)');
 
-        const actualImageType = detectImageType(req.file.buffer);
-        if (!actualImageType || actualImageType !== req.file.mimetype) {
-            throw new ApiError(400, 'File contents must match a valid JPG, PNG, WEBP or GIF image');
+        if (!(await isFullyDecodedImage(req.file.buffer, req.file.mimetype))) {
+            throw new ApiError(
+                400,
+                'Image must be a valid, supported JPG, PNG, WEBP or GIF within the allowed dimensions'
+            );
         }
 
         if (!process.env.IMGBB_API_KEY) {
